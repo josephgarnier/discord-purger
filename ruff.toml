@@ -1,0 +1,33 @@
+indent-width = 4
+line-length = 100
+
+[lint]
+select = ["ALL"]
+ignore = [
+  "EM101", # raw-string-in-exception
+  "S101", # assert
+  "TRY003", # raise-vanilla-args
+]
+fixable = ["ALL"]
+unfixable = []
+future-annotations = true
+
+[format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[lint.pydocstyle]
+convention = "google"
+
+[lint.isort]
+section-order = ["future", "local-folder", "first-party", "third-party", "standard-library"]
+known-local-folder = []
+known-first-party = []
+
+[lint.isort.import-heading]
+future = "Future library"
+local-folder = "Local application"
+first-party = "Local application"
+third-party = "Third-party"
+standard-library = "Standard library"
