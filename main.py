@@ -28,7 +28,7 @@ The script generates two files:
 
 `request_attachment.txt`
 Contains one unique Discord message reference per line, using the
-`channel_id:message_id` format. The file contains identifiers only. It
+`server_id:channel_id:message_id` format. The file contains identifiers only. It
 does not include message contents or attachments.
 
 `request_message.txt`
@@ -570,6 +570,36 @@ def channel_id_from_metadata(payload: JSONValue) -> str | None:
     return None
 
 
+def server_id_from_metadata(payload: JSONValue) -> str | None:
+    """Extract a server/guild ID from channel metadata.
+
+    Args:
+        payload (JSONValue): Decoded channel metadata document.
+
+    Returns:
+        str | None: Valid Discord server/guild ID, or ``None`` when unavailable.
+    """
+    if not isinstance(payload, Mapping):
+        return None
+
+    fields = normalized_mapping(payload)
+    for key in ("serverid", "guildid"):
+        server_id = as_snowflake(fields.get(key))
+        if server_id is not None:
+            return server_id
+
+    for key in ("server", "guild"):
+        nested = fields.get(key)
+        if isinstance(nested, Mapping):
+            nested_fields = normalized_mapping(nested)
+            for nested_key in ("serverid", "guildid", "id"):
+                server_id = as_snowflake(nested_fields.get(nested_key))
+                if server_id is not None:
+                    return server_id
+
+    return None
+
+
 def channel_id_from_path(path: PurePosixPath) -> str | None:
     """Derive a channel ID from a logical container path.
 
@@ -620,6 +650,34 @@ def channel_id_from_record(record: Mapping[str, JSONValue]) -> str | None:
     """
     fields = normalized_mapping(record)
     return as_snowflake(fields.get("channelid"))
+
+
+def server_id_from_record(record: Mapping[str, JSONValue]) -> str | None:
+    """Extract a server/guild ID from a transcript record.
+
+    Args:
+        record (Mapping[str, JSONValue]):  Transcript record to inspect.
+
+    Returns:
+        str | None: Valid Discord server/guild ID, or ``None`` when unavailable.
+    """
+    fields = normalized_mapping(record)
+
+    for key in ("serverid", "guildid"):
+        server_id = as_snowflake(fields.get(key))
+        if server_id is not None:
+            return server_id
+
+    for key in ("server", "guild"):
+        nested = fields.get(key)
+        if isinstance(nested, Mapping):
+            nested_fields = normalized_mapping(nested)
+            for nested_key in ("serverid", "guildid", "id"):
+                server_id = as_snowflake(nested_fields.get(nested_key))
+                if server_id is not None:
+                    return server_id
+
+    return None
 
 
 def looks_like_message(record: Mapping[str, JSONValue]) -> bool:
@@ -688,6 +746,7 @@ TRANSCRIPT_READ_ERRORS = (
 class MessageReference:
     """The two identifiers needed to locate a Discord message."""
 
+    server_id: str
     channel_id: str
     message_id: str
 
@@ -714,7 +773,9 @@ class ScanReport:
         return len({reference.channel_id for reference in self.references})
 
 
-def load_channel_metadata(container: DiscordDataContainer) -> dict[PurePosixPath, str]:
+def load_channel_metadata(
+    container: DiscordDataContainer,
+) -> dict[PurePosixPath, tuple[str | None, str]]:
     """Load channel IDs from metadata files in the messages tree.
 
     Unreadable or malformed ``channel.json`` files are logged and skipped.
@@ -725,7 +786,7 @@ def load_channel_metadata(container: DiscordDataContainer) -> dict[PurePosixPath
     Returns:
         dict[PurePosixPath, str]: Channel IDs indexed by transcript directory.
     """
-    result: dict[PurePosixPath, str] = {}
+    result: dict[PurePosixPath, tuple[str | None, str]] = {}
     for entry in container.entries:
         if entry.logical_path.name.casefold() != "channel.json":
             continue
@@ -733,7 +794,9 @@ def load_channel_metadata(container: DiscordDataContainer) -> dict[PurePosixPath
             continue
 
         try:
-            channel_id = channel_id_from_metadata(container.load_json(entry))
+            payload = container.load_json(entry)
+            channel_id = channel_id_from_metadata(payload)
+            server_id = server_id_from_metadata(payload)
         except JSON_READ_ERRORS as exc:
             logger.warning(
                 "Unreadable channel metadata; using the path as a fallback: %s",
@@ -743,7 +806,7 @@ def load_channel_metadata(container: DiscordDataContainer) -> dict[PurePosixPath
             continue
 
         if channel_id is not None:
-            result[entry.logical_path.parent] = channel_id
+            result[entry.logical_path.parent] = (server_id, channel_id)
 
     return result
 
@@ -860,7 +923,12 @@ def scan_message_references(container: DiscordDataContainer) -> ScanReport:
 
     for entry in transcript_entries:
         report.transcript_files += 1
-        fallback_channel_id = channel_metadata.get(entry.logical_path.parent)
+        metadata_server_id: str | None = None
+        fallback_channel_id: str | None = None
+
+        metadata = channel_metadata.get(entry.logical_path.parent)
+        if metadata is not None:
+            metadata_server_id, fallback_channel_id = metadata
         if fallback_channel_id is None:
             fallback_channel_id = channel_id_from_path(entry.logical_path.parent)
 
@@ -869,13 +937,17 @@ def scan_message_references(container: DiscordDataContainer) -> ScanReport:
                 report.records_seen += 1
                 message_id = message_id_from_record(record)
                 channel_id = channel_id_from_record(record) or fallback_channel_id
-
-                if message_id is None or channel_id is None:
+                server_id = server_id_from_record(record) or metadata_server_id
+                if message_id is None or channel_id is None or server_id is None:
                     report.skipped_records += 1
                     continue
 
                 report.references.add(
-                    MessageReference(channel_id=channel_id, message_id=message_id),
+                    MessageReference(
+                        server_id=server_id,
+                        channel_id=channel_id,
+                        message_id=message_id,
+                    ),
                 )
         except TRANSCRIPT_READ_ERRORS as exc:
             report.malformed_files += 1
@@ -1047,21 +1119,26 @@ def placeholder(label: str) -> str:
 def format_deletion_list(references: set[MessageReference]) -> str:
     """Format message references as a deterministic deletion list.
 
-    References are sorted numerically by channel ID and then by message ID.
+    References are sorted numerically by server ID, channel ID, and message ID.
     The output starts with a format header and ends with a newline.
 
     Args:
         references (set[MessageReference]): Unique references to include.
 
     Returns:
-        str: ``channel_id:message_id`` lines ready for the attachment file.
+        str: ``server_id:channel_id:message_id`` lines ready for the attachment file.
     """
     ordered = sorted(
         references,
-        key=lambda reference: (int(reference.channel_id), int(reference.message_id)),
+        key=lambda reference: (
+            int(reference.server_id),
+            int(reference.channel_id),
+            int(reference.message_id),
+        ),
     )
-    return "# channel_id:message_id\n" + ("").join(
-        f"{reference.channel_id}:{reference.message_id}\n" for reference in ordered
+    return "# server_id:channel_id:message_id\n" + ("").join(
+        f"{reference.server_id}:{reference.channel_id}:{reference.message_id}\n"
+        for reference in ordered
     )
 
 
@@ -1108,7 +1185,7 @@ The attached file "{OUTPUT_ATTACHMENT_FILENAME}" lists the messages concerned:
 - Unique messages: {len(report.references)}
 - Affected channels: {report.channel_count}
 
-Each line uses the "channel_id:message_id" format. To limit the disclosure of
+Each line uses the "server_id:channel_id:message_id" format. To limit the disclosure of
 personal data, this file contains neither the message text nor my attachments.
 
 Please confirm receipt of this request, let me know whether additional identity
@@ -1243,6 +1320,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--data-source",
         type=Path,
         dest="data_source",
+        default=DISCORD_DATA_ARCHIVE_FILE.resolve(),
         metavar="<path>",
         help="Path to the directory or ZIP archive with the Discord data.",
     )

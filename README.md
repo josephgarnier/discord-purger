@@ -116,7 +116,7 @@ python main.py --help
 
 #### Options
 
-| Option | Action |
+| Option | Description |
 | ------ | ------ |
 | `-h` or `--help` | Display up-to-date help information and exit. |
 | `-data <path>` or `--data-source <path>` | Path to the directory or ZIP archive containing the Discord data. If no path is specified, the program first uses `data/discord_data.zip`, followed by `data/discord_data/`. An error is raised if neither exists. |
