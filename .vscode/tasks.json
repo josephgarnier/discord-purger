@@ -3,7 +3,7 @@
   "tasks": [
     {
       "label": "App: Run",
-      "detail": "Run the app",
+      "detail": "Run the app with a zip file",
       "type": "shell",
       "options": {
         "cwd": "${workspaceFolder}"
